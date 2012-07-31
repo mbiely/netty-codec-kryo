@@ -18,10 +18,9 @@ import com.esotericsoftware.kryo.{ Kryo, Registration, Serializer }
 import com.esotericsoftware.kryo.io.{ Input, Output }
 import com.esotericsoftware.kryo.util.{ DefaultClassResolver, MapReferenceResolver }
 
-import org.jboss.netty.handler.codec.frame.{ LengthFieldPrepender, LengthFieldBasedFrameDecoder }
+import org.jboss.netty.channel.{ Channel, ChannelHandlerContext }
 import org.jboss.netty.buffer.{ ChannelBuffer, ChannelBuffers, ChannelBufferInputStream, ChannelBufferOutputStream }
-
-import org.jboss.netty.channel._
+import org.jboss.netty.handler.codec.frame.{ LengthFieldPrepender, LengthFieldBasedFrameDecoder }
 
 import scala.collection.mutable.Queue
 
@@ -79,7 +78,6 @@ object KryoFactory  {
     val kryo = new Kryo(new ClassResolver(encoder), new MapReferenceResolver)
     kryo.setInstantiatorStrategy(new org.objenesis.strategy.StdInstantiatorStrategy())
     kryo setRegistrationRequired false
-    kryo setReferences false
 
     kryo.register(classOf[ClassIdMapping],32)
     
