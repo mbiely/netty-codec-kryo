@@ -12,7 +12,7 @@
 //   See the License for the specific language governing permissions and
 //   limitations under the License.
 
-package ch.epfl.lsr.testing.netty.kryo
+package ch.epfl.lsr.netty.codec.kryo
 
 import com.esotericsoftware.kryo.{ Kryo, Registration, Serializer }
 import com.esotericsoftware.kryo.io.{ Input, Output }
