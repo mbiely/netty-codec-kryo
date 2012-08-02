@@ -22,28 +22,50 @@ import org.jboss.netty.channel.{ Channel, ChannelHandlerContext }
 import org.jboss.netty.buffer.{ ChannelBuffer, ChannelBuffers, ChannelBufferInputStream, ChannelBufferOutputStream }
 import org.jboss.netty.handler.codec.frame.{ LengthFieldPrepender, LengthFieldBasedFrameDecoder }
 
-import scala.collection.mutable.Queue
+import scala.collection.immutable.Queue
+
+import java.util.concurrent.atomic.AtomicInteger
 
 case class ClassIdMapping(val clazzName :String, val id :Int) { 
+  def this(reg :Registration) = this(reg.getType.getName, reg.getId)
   def registerWith(kryo :Kryo) = { 
     val clazz = Class forName clazzName
-    kryo.register(new Registration(clazz, kryo.getDefaultSerializer(clazz), id))
+    val registration = new Registration(clazz, kryo.getDefaultSerializer(clazz), id)
+    kryo.register(registration) == registration
   }
 }
 
 class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver { 
-  var nextId = 128
+  var ids = new AtomicInteger(128)
+  val lock :AnyRef = new Object
+
+  override def getRegistration(clazz :Class[_]) = { 
+    lock.synchronized { 
+      super.getRegistration(clazz)
+    }
+  }
+
+  override def register(reg :Registration) = { 
+    lock.synchronized { 
+      val rv = getRegistration(reg.getClass)
+      if(reg == null)
+	super.register(reg)
+      else
+	rv
+    }
+  }
 
   override def registerImplicit(clazz :Class[_]) = { 
-    val id = nextId
-    nextId += 1
+    val id = ids.getAndIncrement
     
-    val mapping = ClassIdMapping(clazz.getName, id)
+    val reg = new Registration(clazz, kryo.getDefaultSerializer(clazz), id)
+    val rv = this.register(reg)
 
-    if(encoder != null)
-      encoder sendMapping mapping
-
-    mapping registerWith kryo
+    if(rv == reg) { 
+      encoder enqueueRegistration reg
+    }
+    
+    rv
   }
 }
 
@@ -75,7 +97,9 @@ object KryoFactory  {
 
   def getKryo(encoder :KryoEncoder = null) = { 
 
-    val kryo = new Kryo(new ClassResolver(encoder), new MapReferenceResolver)
+    val resolver = if(encoder == null) new DefaultClassResolver() else new ClassResolver(encoder)
+
+    val kryo = new Kryo(resolver, new MapReferenceResolver)
     kryo.setInstantiatorStrategy(new org.objenesis.strategy.StdInstantiatorStrategy())
     kryo setRegistrationRequired false
 
@@ -113,33 +137,55 @@ class KryoDecoder extends LengthFieldBasedFrameDecoder(1048576,0,4,0,4) {
   }
 }
 
-class KryoEncoder extends LengthFieldPrepender(4) { 
-  val kryo = KryoFactory.getKryo(this)
-  var pendingRegistrations :Queue[ClassIdMapping] = Queue.empty
 
-  def sendMapping(registration :ClassIdMapping) { 
-    pendingRegistrations += registration
+class KryoEncoder extends LengthFieldPrepender(4) { 
+  private val lock :AnyRef = new Object
+  private var theQ :Queue[ClassIdMapping] = Queue.empty
+  
+  private def resetQ = { 
+    lock.synchronized { 
+      if(theQ.nonEmpty) { 
+	val rv = theQ
+	theQ = Queue.empty
+	rv
+      } else 
+	theQ
+    }
+  }
+
+  private def enQ(mapping :ClassIdMapping) = { 
+    lock.synchronized { 
+      theQ = theQ enqueue mapping
+    }
+  }
+
+  // clears the queue !
+  def getMappingsBuffer(ctx :ChannelHandlerContext, channel :Channel) = { 
+    val q = resetQ
+
+    q.foldLeft(ChannelBuffers.EMPTY_BUFFER) { 
+      (buffer,mapping) =>
+	ChannelBuffers.wrappedBuffer(buffer, encode2buffer(ctx, channel, mapping))
+    }
+  } 
+
+  private def encode2buffer(ctx :ChannelHandlerContext, channel :Channel, msg :Object) = { 
+    val os = new ChannelBufferOutputStream(ChannelBuffers.dynamicBuffer)
+    val output = new Output(os)
+    kryo.writeClassAndObject(output, msg)
+    output.flush
+    output.close
+    super.encode(ctx, channel, os.buffer).asInstanceOf[ChannelBuffer]
+  }
+
+
+  val kryo = KryoFactory.getKryo(this)
+
+  def enqueueRegistration(registration :Registration) { 
+    enQ(new ClassIdMapping(registration))
   }
   
   override def encode(ctx :ChannelHandlerContext, channel :Channel, msg :Object) = { 
-    def encode2buffer(msg :Object) = { 
-      val os = new ChannelBufferOutputStream(ChannelBuffers.dynamicBuffer)
-      val output = new Output(os)
-      kryo.writeClassAndObject(output, msg)
-      output.flush
-      output.close
-      super.encode(ctx, channel, os.buffer).asInstanceOf[ChannelBuffer]
-    }
-
-    var mappingsBuffer = ChannelBuffers.EMPTY_BUFFER    
-    val msgBuffer = encode2buffer(msg)
-
-    if(pendingRegistrations.nonEmpty) { 
-      pendingRegistrations.dequeueAll { mapping => // somewhat abusing dequeueAll
-	mappingsBuffer = ChannelBuffers.wrappedBuffer(mappingsBuffer, encode2buffer(mapping))
-	true
-      }
-    } 
-    ChannelBuffers.wrappedBuffer(mappingsBuffer,msgBuffer)
+    ChannelBuffers.wrappedBuffer(getMappingsBuffer(ctx, channel), encode2buffer(ctx, channel, msg))
   }
 }
