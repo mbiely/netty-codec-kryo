@@ -96,7 +96,6 @@ object KryoFactory  {
 
 
   def getKryo(encoder :KryoEncoder = null) = { 
-
     val resolver = if(encoder == null) new DefaultClassResolver() else new ClassResolver(encoder)
 
     val kryo = new Kryo(resolver, new MapReferenceResolver)
@@ -185,8 +184,11 @@ class KryoEncoder extends LengthFieldPrepender(4) {
     enQ(new ClassIdMapping(registration))
   }
   
+  def prependWithMappings(ctx :ChannelHandlerContext, channel :Channel, cb :ChannelBuffer) =  
+    ChannelBuffers.wrappedBuffer(getMappingsBuffer(ctx, channel), cb)
+
   override def encode(ctx :ChannelHandlerContext, channel :Channel, msg :Object) = { 
-    ChannelBuffers.wrappedBuffer(getMappingsBuffer(ctx, channel), encode2buffer(ctx, channel, msg))
+    prependWithMappings(ctx, channel, encode2buffer(ctx, channel, msg))
   }
   
 }
