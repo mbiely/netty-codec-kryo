@@ -48,7 +48,7 @@ class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver {
   override def register(reg :Registration) = { 
     lock.synchronized { 
       val rv = getRegistration(reg.getClass)
-      if(reg == null)
+      if(rv == null)
 	super.register(reg)
       else
 	rv
@@ -57,7 +57,7 @@ class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver {
 
   override def registerImplicit(clazz :Class[_]) = { 
     val id = ids.getAndIncrement
-    
+
     val reg = new Registration(clazz, kryo.getDefaultSerializer(clazz), id)
     val rv = this.register(reg)
 
@@ -188,4 +188,5 @@ class KryoEncoder extends LengthFieldPrepender(4) {
   override def encode(ctx :ChannelHandlerContext, channel :Channel, msg :Object) = { 
     ChannelBuffers.wrappedBuffer(getMappingsBuffer(ctx, channel), encode2buffer(ctx, channel, msg))
   }
+  
 }
