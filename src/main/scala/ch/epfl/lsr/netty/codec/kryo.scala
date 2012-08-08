@@ -22,11 +22,11 @@ import org.jboss.netty.channel.{ Channel, ChannelHandlerContext }
 import org.jboss.netty.buffer.{ ChannelBuffer, ChannelBuffers, ChannelBufferInputStream, ChannelBufferOutputStream }
 import org.jboss.netty.handler.codec.frame.{ LengthFieldPrepender, LengthFieldBasedFrameDecoder }
 
-import scala.collection.immutable.Queue
+import java.util.LinkedList 
 
 import java.util.concurrent.atomic.AtomicInteger
 
-case class ClassIdMapping(val clazzName :String, val id :Int) { 
+class ClassIdMapping(val clazzName :String, val id :Int) { 
   def this(reg :Registration) = this(reg.getType.getName, reg.getId)
   def registerWith(kryo :Kryo) = { 
     val clazz = Class forName clazzName
@@ -35,7 +35,7 @@ case class ClassIdMapping(val clazzName :String, val id :Int) {
   }
 }
 
-class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver { 
+class ClassResolver(listener :ImplicitRegistrationListener) extends DefaultClassResolver { 
   var ids = new AtomicInteger(128)
   val lock :AnyRef = new Object
 
@@ -62,7 +62,7 @@ class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver {
     val rv = this.register(reg)
 
     if(rv == reg) { 
-      encoder enqueueRegistration reg
+      listener onImplicitRegistration reg
     }
     
     rv
@@ -71,7 +71,12 @@ class ClassResolver(encoder :KryoEncoder) extends DefaultClassResolver {
 
 
 object KryoFactory  { 
-  val registerDefaultScalaSerializers : (Kryo=>Unit) =
+  // avoid registerDefault being a scala.Function1
+  trait KryoConfigurer { 
+    def configure(kryo :Kryo)
+  }
+
+  def getConfigurer = { 
     try { 
       // scala collections 
       val EnumerationSerializerClazz = Class.forName("com.romix.akka.serialization.kryo.EnumerationSerializer").asInstanceOf[Class[Serializer[_]]]
@@ -79,24 +84,27 @@ object KryoFactory  {
       val ScalaSetSerializerClazz = Class.forName("com.romix.akka.serialization.kryo.ScalaSetSerializer").asInstanceOf[Class[Serializer[_]]]
       val ScalaCollectionSerializerClazz = Class.forName("com.romix.akka.serialization.kryo.ScalaCollectionSerializer").asInstanceOf[Class[Serializer[_]]]
 
-      { kryo :Kryo =>
-	kryo.addDefaultSerializer(classOf[scala.Enumeration#Value], EnumerationSerializerClazz)
-        kryo.addDefaultSerializer(classOf[scala.collection.Map[_,_]], ScalaMapSerializerClazz)
-        kryo.addDefaultSerializer(classOf[scala.collection.Set[_]], ScalaSetSerializerClazz)
-        kryo.addDefaultSerializer(classOf[scala.collection.generic.MapFactory[scala.collection.Map]], ScalaMapSerializerClazz)
-        kryo.addDefaultSerializer(classOf[scala.collection.generic.SetFactory[scala.collection.Set]], ScalaSetSerializerClazz)
-        kryo.addDefaultSerializer(classOf[scala.collection.Traversable[_]], ScalaCollectionSerializerClazz)
-        ()
+      new KryoConfigurer{ def configure(kryo :Kryo) { 
+	kryo.addDefaultSerializer(Class.forName("scala.Enumeration$Value"), EnumerationSerializerClazz)
+        kryo.addDefaultSerializer(Class.forName("scala.collection.Map"), ScalaMapSerializerClazz)
+        kryo.addDefaultSerializer(Class.forName("scala.collection.Set"), ScalaSetSerializerClazz)
+        kryo.addDefaultSerializer(Class.forName("scala.collection.generic.MapFactory"), ScalaMapSerializerClazz)
+        kryo.addDefaultSerializer(Class.forName("scala.collection.generic.SetFactory"), ScalaSetSerializerClazz)
+        kryo.addDefaultSerializer(Class.forName("scala.collection.Traversable"), ScalaCollectionSerializerClazz)
+        }
      }
     } catch { 
       case e :ClassNotFoundException =>
-	System.err.println("akka-kryo-serialization not available");
-	{ kryo :Kryo => ()}
+	System.err.println("scala or akka-kryo-serialization not available ("+e+")");
+      new KryoConfigurer{ def configure(kryo :Kryo) { }}
     }
+  }
+
+  val configureDefaultScalaSerializers : KryoConfigurer = getConfigurer
 
 
-  def getKryo(encoder :KryoEncoder = null) = { 
-    val resolver = if(encoder == null) new DefaultClassResolver() else new ClassResolver(encoder)
+  def getKryo(listener :ImplicitRegistrationListener) = { 
+    val resolver = new ClassResolver(listener)
 
     val kryo = new Kryo(resolver, new MapReferenceResolver)
     kryo.setInstantiatorStrategy(new org.objenesis.strategy.StdInstantiatorStrategy())
@@ -104,15 +112,32 @@ object KryoFactory  {
 
     kryo.register(classOf[ClassIdMapping],32)
     
-    registerDefaultScalaSerializers(kryo)
+    configureDefaultScalaSerializers.configure(kryo)
 
     kryo
   }
 }
 
+trait ImplicitRegistrationListener { 
+  def onImplicitRegistration(registration :Registration) 
 
-class KryoDecoder extends LengthFieldBasedFrameDecoder(1048576,0,4,0,4) { 
-  val kryo = KryoFactory.getKryo(null)
+}
+
+trait KryoFromContext extends ImplicitRegistrationListener { 
+  def kryo(ctx :ChannelHandlerContext) : Kryo = { 
+    var rv = ctx.getAttachment
+    if(rv==null) { 
+      rv = KryoFactory.getKryo(this)
+      ctx.setAttachment(rv)
+    }
+
+    rv.asInstanceOf[Kryo]
+  }
+
+}
+
+class KryoDecoder extends LengthFieldBasedFrameDecoder(1048576,0,4,0,4) with KryoFromContext { 
+  def onImplicitRegistration(registration :Registration) { }
 
   // to avoid copying as in ObjectDecoder
   override def extractFrame(buffer :ChannelBuffer, index :Int, length :Int) = buffer.slice(index,length)
@@ -123,10 +148,10 @@ class KryoDecoder extends LengthFieldBasedFrameDecoder(1048576,0,4,0,4) {
       null
     } else { 
       val is = new ChannelBufferInputStream(frame)
-      val msg = kryo.readClassAndObject(new Input(is))
+      val msg = kryo(ctx).readClassAndObject(new Input(is))
 
       if(msg.isInstanceOf[ClassIdMapping]) { 
-	msg.asInstanceOf[ClassIdMapping].registerWith(kryo)
+	msg.asInstanceOf[ClassIdMapping].registerWith(kryo(ctx))
 	// discard the read data
 	null 
       } else { 
@@ -137,15 +162,19 @@ class KryoDecoder extends LengthFieldBasedFrameDecoder(1048576,0,4,0,4) {
 }
 
 
-class KryoEncoder extends LengthFieldPrepender(4) { 
+class KryoEncoder extends LengthFieldPrepender(4) with KryoFromContext { 
   private val lock :AnyRef = new Object
-  private var theQ :Queue[ClassIdMapping] = Queue.empty
+  private var theQ :LinkedList[ClassIdMapping] = new LinkedList
+
+  def onImplicitRegistration(registration :Registration) { 
+    enQ(new ClassIdMapping(registration))
+  }
   
   private def resetQ = { 
     lock.synchronized { 
-      if(theQ.nonEmpty) { 
+      if(!theQ.isEmpty) { 
 	val rv = theQ
-	theQ = Queue.empty
+	theQ = new LinkedList
 	rv
       } else 
 	theQ
@@ -154,34 +183,29 @@ class KryoEncoder extends LengthFieldPrepender(4) {
 
   private def enQ(mapping :ClassIdMapping) = { 
     lock.synchronized { 
-      theQ = theQ enqueue mapping
+      theQ addLast mapping
     }
   }
 
   // clears the queue !
   def getMappingsBuffer(ctx :ChannelHandlerContext, channel :Channel) = { 
     val q = resetQ
+    var buffer = ChannelBuffers.EMPTY_BUFFER
 
-    q.foldLeft(ChannelBuffers.EMPTY_BUFFER) { 
-      (buffer,mapping) =>
-	ChannelBuffers.wrappedBuffer(buffer, encode2buffer(ctx, channel, mapping))
+    while(!q.isEmpty) { 
+      buffer = ChannelBuffers.wrappedBuffer(buffer, encode2buffer(ctx, channel, q.remove)) 
     }
+
+    buffer
   } 
 
   private def encode2buffer(ctx :ChannelHandlerContext, channel :Channel, msg :Object) = { 
     val os = new ChannelBufferOutputStream(ChannelBuffers.dynamicBuffer)
     val output = new Output(os)
-    kryo.writeClassAndObject(output, msg)
+    kryo(ctx).writeClassAndObject(output, msg)
     output.flush
     output.close
     super.encode(ctx, channel, os.buffer).asInstanceOf[ChannelBuffer]
-  }
-
-
-  val kryo = KryoFactory.getKryo(this)
-
-  def enqueueRegistration(registration :Registration) { 
-    enQ(new ClassIdMapping(registration))
   }
   
   def prependWithMappings(ctx :ChannelHandlerContext, channel :Channel, cb :ChannelBuffer) =  
